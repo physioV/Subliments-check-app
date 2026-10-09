@@ -4,10 +4,13 @@ import pandas as pd
 import os
 from datetime import datetime
 from fpdf import FPDF
+import qrcode
+import smtplib
+from email.message import EmailMessage
 
 # --- SEITEN-KONFIGURATION ---
 st.set_page_config(
-    page_title="Supplement Praxis & Buchhaltung",
+    page_title="Supplement Praxis & Buchhaltung Plus",
     page_icon="🌿",
     layout="wide"
 )
@@ -16,7 +19,7 @@ st.set_page_config(
 if "cart" not in st.session_state:
     st.session_state.cart = []
 
-# --- DATENBANK-SETUP (Erweitert für Kunden, Rechnungen & Wissen) ---
+# --- DATENBANK-SETUP ---
 def init_db():
     conn = sqlite3.connect("supplement_system.db")
     c = conn.cursor()
@@ -33,7 +36,7 @@ def init_db():
         )
     ''')
     
-    # 2. Shop / Lager (Produkte)
+    # 2. Shop / Lager
     c.execute('''
         CREATE TABLE IF NOT EXISTS inventory (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,7 +62,7 @@ def init_db():
         )
     ''')
     
-    # 4. Rechnungen & Buchhaltung
+    # 4. Rechnungen & Buchhaltung (inkl. Status: Aktiv / Storniert / Korrigiert)
     c.execute('''
         CREATE TABLE IF NOT EXISTS invoices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,7 +70,16 @@ def init_db():
             date TEXT,
             customer_name TEXT,
             total_amount REAL,
-            items TEXT
+            items TEXT,
+            status TEXT DEFAULT 'Aktiv'
+        )
+    ''')
+    
+    # 5. Einstellungen / Stammdaten
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
         )
     ''')
     
@@ -76,7 +88,6 @@ def init_db():
 
 init_db()
 
-# --- HILFSFUNKTION FÜR DATENBANK-ABFRAGEN ---
 def run_query(query, params=(), fetch=False):
     conn = sqlite3.connect("supplement_system.db")
     c = conn.cursor()
@@ -88,14 +99,20 @@ def run_query(query, params=(), fetch=False):
     conn.close()
     return data
 
-# --- EXCEL IMPORT (Produkte + Kunden aus Excel einlesen) ---
+def get_setting(key, default=""):
+    res = run_query("SELECT value FROM settings WHERE key = ?", (key,), fetch=True)
+    return res[0][0] if res else default
+
+def save_setting(key, value):
+    run_query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+
+# --- EXCEL IMPORT (Produkte & Kunden) ---
 def import_excel_data(file_source):
     try:
         xls = pd.ExcelFile(file_source)
         conn = sqlite3.connect("supplement_system.db")
         c = conn.cursor()
         
-        # 1. Produkte importieren
         if "Produkte" in xls.sheet_names:
             df_prod = pd.read_excel(xls, sheet_name="Produkte", header=None)
             c.execute("DELETE FROM inventory")
@@ -127,12 +144,11 @@ def import_excel_data(file_source):
                     ''', (barcode, full_name, str(p_name), 10, ek, vk, '2027-12-31'))
                     imported_items += 1
 
-        # 2. Kunden importieren (falls im Sheet 'Kunden' vorhanden)
         if "Kunden" in xls.sheet_names:
             df_cust = pd.read_excel(xls, sheet_name="Kunden", header=None)
             for i in range(1, len(df_cust)):
                 row = df_cust.iloc[i]
-                c_name = row[1] # Name
+                c_name = row[1]
                 if pd.notnull(c_name) and str(c_name).strip() != "" and str(c_name) != "Name":
                     c.execute('''
                         INSERT OR IGNORE INTO customers (customer_name, address, zip_city, phone, email)
@@ -146,32 +162,53 @@ def import_excel_data(file_source):
     except Exception as e:
         return f"Fehler beim Import: {e}"
 
-# --- FORTLAUFENDE RECHNUNGSNUMMER GENERIEREN ---
-def get_next_invoice_nr():
+def get_next_invoice_nr(is_correction=False):
     conn = sqlite3.connect("supplement_system.db")
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM invoices")
     count = c.fetchone()[0]
     conn.close()
     year_prefix = datetime.now().strftime('%yNE')
-    return f"{year_prefix}{str(count + 145).zfill(4)}" # Startet bei z.B. 26NE0145
+    prefix = "STN-" if is_correction else ""
+    return f"{prefix}{year_prefix}{str(count + 145).zfill(4)}"
 
-# --- PDF RECHNUNGS-GENERATOR ---
-def generate_invoice_pdf(invoice_nr, customer_info, items, total):
+# --- QR-CODE GENERATOR FÜR BEZAHLUNG (GiroCode / EPC) ---
+def generate_payment_qr(iban, bic, name, amount, invoice_nr):
+    # EPC QR-Code Standard für SEPA-Überweisungen
+    epc_data = f"BCD\n001\n1\nSCT\n{bic}\n{name}\n{iban}\nEUR{amount:.2f}\n\nRechnung {invoice_nr}"
+    qr = qrcode.make(epc_data)
+    qr_path = "temp_payment_qr.png"
+    qr.save(qr_path)
+    return qr_path
+
+# --- PDF GENERATOR (Inkl. Logo, Bankdaten & QR-Code) ---
+def generate_invoice_pdf(invoice_nr, customer_info, items, total, is_correction=False):
     pdf = FPDF()
     pdf.add_page()
     
-    # Briefkopf Praxis
+    # Logo einfügen, falls vorhanden
+    logo_path = get_setting("logo_path", "")
+    if logo_path and os.path.exists(logo_path):
+        try:
+            pdf.image(logo_path, x=150, y=10, w=45)
+        except:
+            pass
+            
+    # Briefkopf
     pdf.set_font("Arial", 'B', 14)
-    pdf.cell(190, 8, "Nahrungsergänzungsmittel Praxis & Beratung", ln=True)
-    pdf.set_font("Arial", size=10)
-    pdf.cell(190, 5, "Lange Str. 19 | 33775 Versmold | Tel: 05423 / 328 958 3", ln=True)
-    pdf.line(10, 25, 200, 25)
-    pdf.ln(15)
+    practice_name = get_setting("practice_name", "Nahrungsergänzungsmittel Praxis")
+    pdf.cell(190, 8, practice_name, ln=True)
     
-    # Rechnungsdetails
-    pdf.set_font("Arial", 'B', 12)
-    pdf.cell(100, 6, f"RECHNUNG: {invoice_nr}", ln=False)
+    pdf.set_font("Arial", size=9)
+    address_line = get_setting("address_line", "Lange Str. 19 | 33775 Versmold | Tel: 05423 / 328 958 3")
+    pdf.cell(190, 5, address_line, ln=True)
+    pdf.line(10, 26, 200, 26)
+    pdf.ln(10)
+    
+    # Rechnungsart & Nummer
+    title_text = "RECHNUNGSKORREKTUR / STORNO" if is_correction else "RECHNUNG"
+    pdf.set_font("Arial", 'B', 13)
+    pdf.cell(100, 6, f"{title_text}: {invoice_nr}", ln=False)
     pdf.set_font("Arial", size=10)
     pdf.cell(90, 6, f"Datum: {datetime.now().strftime('%d.%m.%Y')}", ln=True, align='R')
     pdf.ln(5)
@@ -180,10 +217,10 @@ def generate_invoice_pdf(invoice_nr, customer_info, items, total):
     pdf.set_font("Arial", 'B', 10)
     pdf.cell(190, 6, "Rechnungsempfänger:", ln=True)
     pdf.set_font("Arial", size=10)
-    pdf.cell(190, 5, f"{customer_info.get('name', 'Max Mustermann')}", ln=True)
+    pdf.cell(190, 5, f"{customer_info.get('name', '')}", ln=True)
     pdf.cell(190, 5, f"{customer_info.get('address', '')}", ln=True)
     pdf.cell(190, 5, f"{customer_info.get('zip_city', '')}", ln=True)
-    pdf.ln(10)
+    pdf.ln(8)
     
     # Positionstabelle
     pdf.set_font("Arial", 'B', 10)
@@ -197,179 +234,236 @@ def generate_invoice_pdf(invoice_nr, customer_info, items, total):
     for item in items:
         pdf.cell(110, 8, str(item['name'])[:50], border=1)
         pdf.cell(30, 8, str(item['qty']), border=1, align='C')
-        pdf.cell(50, 8, f"{item['price'] * item['qty']:.2f} €", border=1, align='R')
+        pdf.cell(50, 8, f"{item['price'] * item['qty']:.2f} EUR", border=1, align='R')
         pdf.ln()
         
     pdf.set_font("Arial", 'B', 11)
-    pdf.cell(140, 10, "Gesamtsumme (inkl. MwSt.):", border=0, align='R')
-    pdf.cell(50, 10, f"{total:.2f} €", border=1, align='R', fill=True)
+    pdf.cell(140, 10, "Gesamtsumme:", border=0, align='R')
+    pdf.cell(50, 10, f"{total:.2f} EUR", border=1, align='R', fill=True)
+    pdf.ln(10)
     
-    return pdf.output(dest='S').encode('latin-1')
+    # Bankdaten & Zahlungs-QR-Code
+    iban = get_setting("iban", "")
+    bic = get_setting("bic", "")
+    bank_name = get_setting("bank_name", "")
+    tax_no = get_setting("tax_no", "")
+    
+    pdf.set_font("Arial", size=9)
+    pdf.cell(110, 5, f"Bankverbindung: {bank_name}", ln=False)
+    pdf.cell(80, 5, f"Steuernummer / USt-IdNr: {tax_no}", ln=True)
+    pdf.cell(110, 5, f"IBAN: {iban} | BIC: {bic}", ln=True)
+    
+    # QR Code einfügen, wenn IBAN vorhanden
+    if iban:
+        try:
+            qr_file = generate_payment_qr(iban, bic, practice_name, total, invoice_nr)
+            pdf.image(qr_file, x=155, y=pdf.get_y() + 2, w=35)
+            pdf.set_font("Arial", 'I', 8)
+            pdf.set_xy(145, pdf.get_y() + 38)
+            pdf.cell(55, 4, "QR-Code mit Banking-App scannen", align='C')
+        except:
+            pass
 
-# --- OBERFLÄCHE (4 TABS) ---
+    return pdf.output(dest='S').encode('latin-1'), f"Rechnung_{invoice_nr}.pdf"
+
+# --- E-MAIL VERSAND FUNKTION ---
+def send_invoice_email(to_email, invoice_nr, pdf_bytes, filename):
+    smtp_server = get_setting("smtp_server", "smtp.gmail.com")
+    smtp_port = int(get_setting("smtp_port", "587"))
+    smtp_user = get_setting("smtp_user", "")
+    smtp_pass = get_setting("smtp_pass", "")
+    
+    if not smtp_user or not smtp_pass:
+        return False, "Bitte erst SMTP-Zugangsdaten in den Einstellungen hinterlegen!"
+        
+    try:
+        msg = EmailMessage()
+        msg['Subject'] = f"Ihre Rechnung {invoice_nr}"
+        msg['From'] = smtp_user
+        msg['To'] = to_email
+        msg.set_content("Sehr geehrte(r) Kunde/Patient,\n\nAnbei erhalten Sie Ihre Rechnung als PDF.\n\nVielen Dank für Ihr Vertrauen!\n\nMit freundlichen Grüßen")
+        
+        msg.add_attachment(pdf_bytes, maintype='application', subtype='pdf', filename=filename)
+        
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        return True, "E-Mail erfolgreich versendet!"
+    except Exception as e:
+        return False, f"Fehler beim E-Mail-Versand: {e}"
+
+# --- OBERFLÄCHE (5 TABS) ---
 st.title("🌿 Intelligent Supplement Management & Accounting")
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "🧪 1. Wissens- & Wirkstoff-DB", 
-    "📦 2. Shop, Lager & Excel", 
-    "🛒 3. Beratung, Kasse & Rechnungen", 
-    "📊 4. Buchhaltung & Umsätze"
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "🧪 1. Wissens-DB", 
+    "📦 2. Shop & Lager", 
+    "🛒 3. Kasse & Rechnungen", 
+    "📊 4. Buchhaltung & Storno",
+    "⚙️ 5. Einstellungen & Logo"
 ])
 
-# ==========================================
-# TAB 1: WISSENS-DATENBANK & VERKNÜPFUNG
-# ==========================================
+# TAB 1: WISSEN
 with tab1:
-    st.header("Wirkstoff- & Kofaktoren-Wissensdatenbank")
+    st.header("Wirkstoff- & Kofaktoren-Datenbank")
     c1, c2 = st.columns([1, 2])
-    
     with c1:
-        st.subheader("Wirkstoff erfassen")
-        sub_name = st.text_input("Wirkstoff / Stoffname (z.B. Vitamin D3)")
+        sub_name = st.text_input("Wirkstoff-Name")
         sub_cat = st.selectbox("Kategorie", ["Vitamin", "Mineralstoff", "Aminosäure", "Pflanzenextrakt", "Komplex"])
-        sub_eff = st.text_area("Wirkungsweise & Indikation")
-        sub_cof = st.text_area("Wichtige Kofaktoren (z.B. K2, Magnesium)")
-        sub_int = st.text_area("Wechselwirkungen & Hinweise (z.B. Zeitversetzt zu Zink)")
-        
-        if st.button("Wirkstoff speichern"):
+        sub_eff = st.text_area("Wirkungsweise")
+        sub_cof = st.text_area("Sinnvolle Kofaktoren")
+        sub_int = st.text_area("Wechselwirkungen")
+        if st.button("Speichern"):
             if sub_name:
-                try:
-                    run_query("INSERT INTO knowledge (substance, category, effects, cofactors, interactions) VALUES (?, ?, ?, ?, ?)",
-                              (sub_name, sub_cat, sub_eff, sub_cof, sub_int))
-                    st.success(f"'{sub_name}' in Wissensdatenbank hinterlegt!")
-                except:
-                    st.error("Wirkstoff existiert bereits.")
-
+                run_query("INSERT INTO knowledge (substance, category, effects, cofactors, interactions) VALUES (?, ?, ?, ?, ?)",
+                          (sub_name, sub_cat, sub_eff, sub_cof, sub_int))
+                st.success("Gespeichert!")
     with c2:
-        st.subheader("Vorhandene Wirkstoffe & Synergien")
         k_data = run_query("SELECT substance, category, cofactors, interactions FROM knowledge", fetch=True)
         if k_data:
-            df_k = pd.DataFrame(k_data, columns=["Wirkstoff", "Kategorie", "Kofaktoren", "Wechselwirkungen"])
-            st.dataframe(df_k, use_container_width=True, height=450)
-        else:
-            st.info("Noch keine Wissens-Einträge hinterlegt.")
+            st.dataframe(pd.DataFrame(k_data, columns=["Wirkstoff", "Kategorie", "Kofaktoren", "Wechselwirkungen"]), use_container_width=True)
 
-# ==========================================
-# TAB 2: SHOP, LAGER & EXCEL IMPORT
-# ==========================================
+# TAB 2: LAGER
 with tab2:
     st.header("Shop- & Lagerbestand")
-    
-    with st.expander("📥 Excel-Datenbank (NE-Tool_AI.xlsx) importieren (Produkte & Kunden)"):
-        uploaded_file = st.file_uploader("Excel-Datei auswählen", type=["xlsx", "xls"])
-        if uploaded_file is not None:
-            msg = import_excel_data(uploaded_file)
-            st.success(msg)
+    with st.expander("📥 Excel-Daten importieren (NE-Tool_AI.xlsx)"):
+        up_file = st.file_uploader("Datei wählen", type=["xlsx", "xls"])
+        if up_file:
+            st.success(import_excel_data(up_file))
             st.rerun()
-
-    st.subheader("Lagerbestand (Artikelübersicht)")
     inv_data = run_query("SELECT barcode, product_name, stock, purchase_price, selling_price, mhd FROM inventory", fetch=True)
     if inv_data:
-        df_inv = pd.DataFrame(inv_data, columns=["Artikelnummer", "Produktbezeichnung", "Bestand", "EK (€)", "VK (€)", "MHD"])
-        st.dataframe(df_inv, use_container_width=True, height=450)
-    else:
-        st.info("Lager ist leer. Bitte oben die Excel-Datei hochladen.")
+        st.dataframe(pd.DataFrame(inv_data, columns=["Barcode", "Produkt", "Bestand", "EK (€)", "VK (€)", "MHD"]), use_container_width=True)
 
-# ==========================================
-# TAB 3: BERATUNG, KASSE & RECHNUNGSSTELLUNG
-# ==========================================
+# TAB 3: KASSE & RECHNUNG
 with tab3:
     st.header("Beratung, Kasse & Rechnungsstellung")
-    
     col_l, col_r = st.columns([1, 1])
     
     with col_l:
-        st.subheader("1. Intelligente Produkt- & Wissenssuche")
+        st.subheader("1. Produkte auswählen")
         products = run_query("SELECT barcode, product_name, selling_price, substance_link FROM inventory", fetch=True)
-        
         if products:
             prod_dict = {f"{p[1]} ({p[2]:.2f} €)": p for p in products}
-            selected_label = st.selectbox("Produkt für Warenkorb wählen", list(prod_dict.keys()))
-            sel_p = prod_dict[selected_label]
+            sel_label = st.selectbox("Produkt", list(prod_dict.keys()))
+            sel_p = prod_dict[sel_label]
             
-            # Wissensdatenbank direkt dazu anzeigen
             if sel_p[3]:
-                know_match = run_query("SELECT effects, cofactors, interactions FROM knowledge WHERE substance LIKE ?", (f"%{sel_p[3]}%",), fetch=True)
-                if know_match:
-                    st.info(f"💡 **Wirkung:** {know_match[0][0]}\n\n🔗 **Kofaktoren:** {know_match[0][1]}\n\n⚠️ **Hinweis:** {know_match[0][2]}")
-            
-            if st.button("Zum Warenkorb hinzufügen"):
+                km = run_query("SELECT effects, cofactors, interactions FROM knowledge WHERE substance LIKE ?", (f"%{sel_p[3]}%",), fetch=True)
+                if km:
+                    st.info(f"💡 **Wirkung:** {km[0][0]}\n\n🔗 **Kofaktoren:** {km[0][1]}\n\n⚠️ **Hinweis:** {km[0][2]}")
+                    
+            if st.button("In den Warenkorb"):
                 st.session_state.cart.append({"name": sel_p[1], "price": sel_p[2], "qty": 1})
-                st.success(f"'{sel_p[1]}' hinzugefügt!")
-        else:
-            st.warning("Keine Produkte im Lager.")
+                st.success("Hinzugefügt!")
 
     with col_r:
-        st.subheader("2. Kundenauswahl & Rechnungsdaten")
-        
-        # Kunden aus DB laden
+        st.subheader("2. Kunde & Checkout")
         customers_db = run_query("SELECT customer_name, address, zip_city, phone, email FROM customers", fetch=True)
-        cust_names = [c[0] for c in customers_db] if customers_db else ["Neuen Kunden anlegen"]
+        cust_names = [c[0] for c in customers_db] if customers_db else ["Neuer Kunde"]
+        sel_cust = st.selectbox("Kunde", cust_names)
         
-        selected_cust_name = st.selectbox("Kunde auswählen", cust_names)
-        
-        if selected_cust_name == "Neuen Kunden anlegen" or not customers_db:
-            c_name = st.text_input("Name / Firma", value="Max Mustermann")
-            c_addr = st.text_input("Adresse", value="Musterweg 1")
-            c_zip = st.text_input("PLZ & Ort", value="12345 Musterstadt")
-            c_phone = st.text_input("Telefon", value="0123456789")
+        if sel_cust == "Neuer Kunde" or not customers_db:
+            c_name = st.text_input("Name", value="Max Mustermann")
+            c_addr = st.text_input("Straße", value="Musterweg 1")
+            c_zip = st.text_input("PLZ Ort", value="12345 Stadt")
+            c_phone = st.text_input("Telefon")
             c_email = st.text_input("E-Mail", value="kunde@mail.de")
-            
-            if st.button("Kunden in Datenbank speichern"):
-                run_query("INSERT OR IGNORE INTO customers (customer_name, address, zip_city, phone, email) VALUES (?, ?, ?, ?, ?)",
-                          (c_name, c_addr, c_zip, c_phone, c_email))
-                st.success("Kunde gespeichert! Bitte Ansicht aktualisieren.")
-                st.rerun()
-            customer_info = {"name": c_name, "address": c_addr, "zip_city": c_zip}
+            customer_info = {"name": c_name, "address": c_addr, "zip_city": c_zip, "email": c_email}
         else:
-            # Kundendaten aus DB holen
-            c_row = [c for c in customers_db if c[0] == selected_cust_name][0]
-            customer_info = {"name": c_row[0], "address": c_row[1], "zip_city": c_row[2]}
-            st.write(f"📍 **Adresse:** {c_row[1]}, {c_row[2]}")
-            st.write(f"📞 **Tel/Mail:** {c_row[3]} | {c_row[4]}")
+            row = [c for c in customers_db if c[0] == sel_cust][0]
+            customer_info = {"name": row[0], "address": row[1], "zip_city": row[2], "email": row[4]}
+            st.write(f"📍 {row[1]}, {row[2]} | ✉️ {row[4]}")
+            c_email = row[4]
 
-        st.markdown("---")
-        st.subheader("3. Warenkorb & Checkout")
         if st.session_state.cart:
-            cart_df = pd.DataFrame(st.session_state.cart)
-            st.dataframe(cart_df, use_container_width=True)
+            st.dataframe(pd.DataFrame(st.session_state.cart), use_container_width=True)
+            total_sum = sum(i['price'] * i['qty'] for i in st.session_state.cart)
+            st.markdown(f"### **Gesamt: {total_sum:.2f} €**")
             
-            total_sum = sum(item['price'] * item['qty'] for item in st.session_state.cart)
-            st.markdown(f"### **Gesamtsumme: {total_sum:.2f} €**")
-            
-            if st.button("Rechnung erstellen & Buchung abschließen"):
-                invoice_nr = get_next_invoice_nr()
+            if st.button("Rechnung erstellen & PDF generieren"):
+                inv_nr = get_next_invoice_nr()
+                pdf_bytes, filename = generate_invoice_pdf(inv_nr, customer_info, st.session_state.cart, total_sum)
                 
-                # PDF erzeugen
-                pdf_bytes = generate_invoice_pdf(invoice_nr, customer_info, st.session_state.cart, total_sum)
+                run_query("INSERT INTO invoices (invoice_nr, date, customer_name, total_amount, items, status) VALUES (?, ?, ?, ?, ?, ?)",
+                          (inv_nr, datetime.now().strftime("%Y-%m-%d"), customer_info['name'], total_sum, str(st.session_state.cart), 'Aktiv'))
                 
-                # In Rechnungs-DB speichern
-                run_query("INSERT INTO invoices (invoice_nr, date, customer_name, total_amount, items) VALUES (?, ?, ?, ?, ?)",
-                          (invoice_nr, datetime.now().strftime("%Y-%m-%d"), customer_info['name'], total_sum, str(st.session_state.cart)))
+                st.success(f"Rechnung {inv_nr} erstellt!")
+                st.download_button("📄 PDF herunterladen", data=pdf_bytes, file_name=filename, mime="application/pdf")
                 
-                st.success(f"Rechnung {invoice_nr} erfolgreich erstellt und verbucht!")
-                st.download_button(
-                    label="📄 Offizielle Rechnungs-PDF herunterladen",
-                    data=pdf_bytes,
-                    file_name=f"Rechnung_{invoice_nr}_{customer_info['name']}.pdf",
-                    mime="application/pdf"
-                )
+                if c_email:
+                    if st.button("✉️ Rechnung direkt per E-Mail senden"):
+                        success, msg = send_invoice_email(c_email, inv_nr, pdf_bytes, filename)
+                        if success:
+                            st.success(msg)
+                        else:
+                            st.error(msg)
                 st.session_state.cart = []
         else:
             st.info("Warenkorb ist leer.")
 
-# ==========================================
-# TAB 4: BUCHHALTUNG & UMSÄTZE
-# ==========================================
+# TAB 4: BUCHHALTUNG & STORNO
 with tab4:
-    st.header("Buchhaltung & Rechnungsarchiv")
-    invoices_data = run_query("SELECT invoice_nr, date, customer_name, total_amount, items FROM invoices ORDER BY id DESC", fetch=True)
-    
-    if invoices_data:
-        df_invs = pd.DataFrame(invoices_data, columns=["Rechnungs-Nr", "Datum", "Kunde", "Betrag (€)", "Positionen"])
-        st.dataframe(df_invs, use_container_width=True)
+    st.header("Buchhaltung, Rechnungsarchiv & Korrekturen")
+    invoices = run_query("SELECT invoice_nr, date, customer_name, total_amount, status FROM invoices ORDER BY id DESC", fetch=True)
+    if invoices:
+        st.dataframe(pd.DataFrame(invoices, columns=["Rechnungs-Nr", "Datum", "Kunde", "Betrag (€)", "Status"]), use_container_width=True)
         
-        total_revenue = sum([row[3] for row in invoices_data])
-        st.metric(label="Gesamtumsatz aller erstellten Rechnungen", value=f"{total_revenue:.2f} €")
+        st.subheader("Rechnung stornieren / Korrektur erstellen")
+        inv_to_cancel = st.selectbox("Rechnung für Korrektur auswählen", [inv[0] for inv in invoices if inv[4] == 'Aktiv'])
+        if inv_to_cancel and st.button("Gutschrift / Storno-Rechnung erstellen"):
+            orig = run_query("SELECT customer_name, total_amount, items FROM invoices WHERE invoice_nr = ?", (inv_to_cancel,), fetch=True)
+            if orig:
+                corr_nr = get_next_invoice_nr(is_correction=True)
+                run_query("UPDATE invoices SET status = 'Storniert' WHERE invoice_nr = ?", (inv_to_cancel,))
+                run_query("INSERT INTO invoices (invoice_nr, date, customer_name, total_amount, items, status) VALUES (?, ?, ?, ?, ?, ?)",
+                          (corr_nr, datetime.now().strftime("%Y-%m-%d"), orig[0][0], -orig[0][1], orig[0][2], 'Korrektur'))
+                st.success(f"Korrekturrechnung {corr_nr} für Rechnung {inv_to_cancel} erfolgreich erstellt!")
+                st.rerun()
     else:
-        st.info("Bisher wurden noch keine Rechnungen über das System ausgestellt.")
+        st.info("Keine Rechnungen vorhanden.")
+
+# TAB 5: EINSTELLUNGEN & LOGO
+with tab5:
+    st.header("Einstellungen, Bankdaten & Logo")
+    
+    practice_name = st.text_input("Praxis- / Firmenname", value=get_setting("practice_name", "Nahrungsergänzungsmittel Praxis"))
+    address_line = st.text_input("Adresszeile (Briefkopf)", value=get_setting("address_line", "Lange Str. 19 | 33775 Versmold"))
+    
+    st.markdown("---")
+    st.subheader("Bankdaten & Steuerdaten (für Rechnungen & QR-Code)")
+    bank_name = st.text_input("Bankname", value=get_setting("bank_name", "Volksbank"))
+    iban = st.text_input("IBAN", value=get_setting("iban", ""))
+    bic = st.text_input("BIC", value=get_setting("bic", ""))
+    tax_no = st.text_input("Steuernummer / USt-IdNr", value=get_setting("tax_no", ""))
+    
+    st.markdown("---")
+    st.subheader("E-Mail / SMTP Versand-Zugangsdaten")
+    smtp_server = st.text_input("SMTP Server", value=get_setting("smtp_server", "smtp.gmail.com"))
+    smtp_port = st.text_input("SMTP Port", value=get_setting("smtp_port", "587"))
+    smtp_user = st.text_input("E-Mail Absenderadresse", value=get_setting("smtp_user", ""))
+    smtp_pass = st.text_input("E-Mail App-Passwort", type="password", value=get_setting("smtp_pass", ""))
+    
+    st.markdown("---")
+    st.subheader("Firmenlogo hochladen")
+    logo_file = st.file_uploader("Logo (PNG oder JPG)", type=["png", "jpg", "jpeg"])
+    if logo_file:
+        logo_path = "uploaded_logo.png"
+        with open(logo_path, "wb") as f:
+            f.write(logo_file.getbuffer())
+        save_setting("logo_path", logo_path)
+        st.success("Logo erfolgreich gespeichert!")
+        
+    if st.button("Einstellungen speichern"):
+        save_setting("practice_name", practice_name)
+        save_setting("address_line", address_line)
+        save_setting("bank_name", bank_name)
+        save_setting("iban", iban)
+        save_setting("bic", bic)
+        save_setting("tax_no", tax_no)
+        save_setting("smtp_server", smtp_server)
+        save_setting("smtp_port", smtp_port)
+        save_setting("smtp_user", smtp_user)
+        save_setting("smtp_pass", smtp_pass)
+        st.success("Alle Einstellungen erfolgreich aktualisiert!")
