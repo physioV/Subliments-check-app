@@ -19,7 +19,7 @@ st.set_page_config(
 if "cart" not in st.session_state:
     st.session_state.cart = []
 
-# --- DATENBANK-SETUP & MIGRATION ---
+# --- DATENBANK-SETUP & MIGRATION (Ganz an den Anfang gesetzt) ---
 def init_db():
     conn = sqlite3.connect("supplement_system.db")
     c = conn.cursor()
@@ -75,12 +75,6 @@ def init_db():
         )
     ''')
     
-    # Sicherheits-Migration: Prüfen ob Spalte 'status' existiert, falls alte DB aktiv ist
-    try:
-        c.execute("SELECT status FROM invoices LIMIT 1")
-    except sqlite3.OperationalError:
-        c.execute("ALTER TABLE invoices ADD COLUMN status TEXT DEFAULT 'Aktiv'")
-    
     # 5. Einstellungen / Stammdaten
     c.execute('''
         CREATE TABLE IF NOT EXISTS settings (
@@ -92,17 +86,23 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Datenbank direkt beim Start initialisieren!
 init_db()
 
+# --- HILFSFUNKTIONEN ---
 def run_query(query, params=(), fetch=False):
     conn = sqlite3.connect("supplement_system.db")
     c = conn.cursor()
-    c.execute(query, params)
-    data = None
-    if fetch:
-        data = c.fetchall()
-    conn.commit()
-    conn.close()
+    try:
+        c.execute(query, params)
+        data = None
+        if fetch:
+            data = c.fetchall()
+        conn.commit()
+    except Exception as e:
+        data = None
+    finally:
+        conn.close()
     return data
 
 def get_setting(key, default=""):
@@ -112,7 +112,7 @@ def get_setting(key, default=""):
 def save_setting(key, value):
     run_query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
 
-# --- EXCEL IMPORT (Produkte & Kunden) ---
+# --- EXCEL IMPORT ---
 def import_excel_data(file_source):
     try:
         xls = pd.ExcelFile(file_source)
@@ -178,7 +178,7 @@ def get_next_invoice_nr(is_correction=False):
     prefix = "STN-" if is_correction else ""
     return f"{prefix}{year_prefix}{str(count + 145).zfill(4)}"
 
-# --- QR-CODE GENERATOR FÜR BEZAHLUNG (GiroCode / EPC) ---
+# --- QR-CODE & PDF GENERATOR ---
 def generate_payment_qr(iban, bic, name, amount, invoice_nr):
     epc_data = f"BCD\n001\n1\nSCT\n{bic}\n{name}\n{iban}\nEUR{amount:.2f}\n\nRechnung {invoice_nr}"
     qr = qrcode.make(epc_data)
@@ -186,7 +186,6 @@ def generate_payment_qr(iban, bic, name, amount, invoice_nr):
     qr.save(qr_path)
     return qr_path
 
-# --- PDF GENERATOR ---
 def generate_invoice_pdf(invoice_nr, customer_info, items, total, is_correction=False):
     pdf = FPDF()
     pdf.add_page()
