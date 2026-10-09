@@ -19,7 +19,7 @@ st.set_page_config(
 if "cart" not in st.session_state:
     st.session_state.cart = []
 
-# --- DATENBANK-SETUP ---
+# --- DATENBANK-SETUP & MIGRATION ---
 def init_db():
     conn = sqlite3.connect("supplement_system.db")
     c = conn.cursor()
@@ -62,7 +62,7 @@ def init_db():
         )
     ''')
     
-    # 4. Rechnungen & Buchhaltung (inkl. Status: Aktiv / Storniert / Korrigiert)
+    # 4. Rechnungen & Buchhaltung
     c.execute('''
         CREATE TABLE IF NOT EXISTS invoices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,6 +74,12 @@ def init_db():
             status TEXT DEFAULT 'Aktiv'
         )
     ''')
+    
+    # Sicherheits-Migration: Prüfen ob Spalte 'status' existiert, falls alte DB aktiv ist
+    try:
+        c.execute("SELECT status FROM invoices LIMIT 1")
+    except sqlite3.OperationalError:
+        c.execute("ALTER TABLE invoices ADD COLUMN status TEXT DEFAULT 'Aktiv'")
     
     # 5. Einstellungen / Stammdaten
     c.execute('''
@@ -174,19 +180,17 @@ def get_next_invoice_nr(is_correction=False):
 
 # --- QR-CODE GENERATOR FÜR BEZAHLUNG (GiroCode / EPC) ---
 def generate_payment_qr(iban, bic, name, amount, invoice_nr):
-    # EPC QR-Code Standard für SEPA-Überweisungen
     epc_data = f"BCD\n001\n1\nSCT\n{bic}\n{name}\n{iban}\nEUR{amount:.2f}\n\nRechnung {invoice_nr}"
     qr = qrcode.make(epc_data)
     qr_path = "temp_payment_qr.png"
     qr.save(qr_path)
     return qr_path
 
-# --- PDF GENERATOR (Inkl. Logo, Bankdaten & QR-Code) ---
+# --- PDF GENERATOR ---
 def generate_invoice_pdf(invoice_nr, customer_info, items, total, is_correction=False):
     pdf = FPDF()
     pdf.add_page()
     
-    # Logo einfügen, falls vorhanden
     logo_path = get_setting("logo_path", "")
     if logo_path and os.path.exists(logo_path):
         try:
@@ -194,7 +198,6 @@ def generate_invoice_pdf(invoice_nr, customer_info, items, total, is_correction=
         except:
             pass
             
-    # Briefkopf
     pdf.set_font("Arial", 'B', 14)
     practice_name = get_setting("practice_name", "Nahrungsergänzungsmittel Praxis")
     pdf.cell(190, 8, practice_name, ln=True)
@@ -205,7 +208,6 @@ def generate_invoice_pdf(invoice_nr, customer_info, items, total, is_correction=
     pdf.line(10, 26, 200, 26)
     pdf.ln(10)
     
-    # Rechnungsart & Nummer
     title_text = "RECHNUNGSKORREKTUR / STORNO" if is_correction else "RECHNUNG"
     pdf.set_font("Arial", 'B', 13)
     pdf.cell(100, 6, f"{title_text}: {invoice_nr}", ln=False)
@@ -213,7 +215,6 @@ def generate_invoice_pdf(invoice_nr, customer_info, items, total, is_correction=
     pdf.cell(90, 6, f"Datum: {datetime.now().strftime('%d.%m.%Y')}", ln=True, align='R')
     pdf.ln(5)
     
-    # Kunde
     pdf.set_font("Arial", 'B', 10)
     pdf.cell(190, 6, "Rechnungsempfänger:", ln=True)
     pdf.set_font("Arial", size=10)
@@ -222,7 +223,6 @@ def generate_invoice_pdf(invoice_nr, customer_info, items, total, is_correction=
     pdf.cell(190, 5, f"{customer_info.get('zip_city', '')}", ln=True)
     pdf.ln(8)
     
-    # Positionstabelle
     pdf.set_font("Arial", 'B', 10)
     pdf.set_fill_color(240, 240, 240)
     pdf.cell(110, 8, "Produktbezeichnung", border=1, fill=True)
@@ -242,7 +242,6 @@ def generate_invoice_pdf(invoice_nr, customer_info, items, total, is_correction=
     pdf.cell(50, 10, f"{total:.2f} EUR", border=1, align='R', fill=True)
     pdf.ln(10)
     
-    # Bankdaten & Zahlungs-QR-Code
     iban = get_setting("iban", "")
     bic = get_setting("bic", "")
     bank_name = get_setting("bank_name", "")
@@ -253,7 +252,6 @@ def generate_invoice_pdf(invoice_nr, customer_info, items, total, is_correction=
     pdf.cell(80, 5, f"Steuernummer / USt-IdNr: {tax_no}", ln=True)
     pdf.cell(110, 5, f"IBAN: {iban} | BIC: {bic}", ln=True)
     
-    # QR Code einfügen, wenn IBAN vorhanden
     if iban:
         try:
             qr_file = generate_payment_qr(iban, bic, practice_name, total, invoice_nr)
@@ -266,7 +264,7 @@ def generate_invoice_pdf(invoice_nr, customer_info, items, total, is_correction=
 
     return pdf.output(dest='S').encode('latin-1'), f"Rechnung_{invoice_nr}.pdf"
 
-# --- E-MAIL VERSAND FUNKTION ---
+# --- E-MAIL VERSAND ---
 def send_invoice_email(to_email, invoice_nr, pdf_bytes, filename):
     smtp_server = get_setting("smtp_server", "smtp.gmail.com")
     smtp_port = int(get_setting("smtp_port", "587"))
@@ -282,7 +280,6 @@ def send_invoice_email(to_email, invoice_nr, pdf_bytes, filename):
         msg['From'] = smtp_user
         msg['To'] = to_email
         msg.set_content("Sehr geehrte(r) Kunde/Patient,\n\nAnbei erhalten Sie Ihre Rechnung als PDF.\n\nVielen Dank für Ihr Vertrauen!\n\nMit freundlichen Grüßen")
-        
         msg.add_attachment(pdf_bytes, maintype='application', subtype='pdf', filename=filename)
         
         with smtplib.SMTP(smtp_server, smtp_port) as server:
@@ -304,7 +301,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "⚙️ 5. Einstellungen & Logo"
 ])
 
-# TAB 1: WISSEN
+# TAB 1
 with tab1:
     st.header("Wirkstoff- & Kofaktoren-Datenbank")
     c1, c2 = st.columns([1, 2])
@@ -324,7 +321,7 @@ with tab1:
         if k_data:
             st.dataframe(pd.DataFrame(k_data, columns=["Wirkstoff", "Kategorie", "Kofaktoren", "Wechselwirkungen"]), use_container_width=True)
 
-# TAB 2: LAGER
+# TAB 2
 with tab2:
     st.header("Shop- & Lagerbestand")
     with st.expander("📥 Excel-Daten importieren (NE-Tool_AI.xlsx)"):
@@ -336,7 +333,7 @@ with tab2:
     if inv_data:
         st.dataframe(pd.DataFrame(inv_data, columns=["Barcode", "Produkt", "Bestand", "EK (€)", "VK (€)", "MHD"]), use_container_width=True)
 
-# TAB 3: KASSE & RECHNUNG
+# TAB 3
 with tab3:
     st.header("Beratung, Kasse & Rechnungsstellung")
     col_l, col_r = st.columns([1, 1])
@@ -403,7 +400,7 @@ with tab3:
         else:
             st.info("Warenkorb ist leer.")
 
-# TAB 4: BUCHHALTUNG & STORNO
+# TAB 4
 with tab4:
     st.header("Buchhaltung, Rechnungsarchiv & Korrekturen")
     invoices = run_query("SELECT invoice_nr, date, customer_name, total_amount, status FROM invoices ORDER BY id DESC", fetch=True)
@@ -411,20 +408,24 @@ with tab4:
         st.dataframe(pd.DataFrame(invoices, columns=["Rechnungs-Nr", "Datum", "Kunde", "Betrag (€)", "Status"]), use_container_width=True)
         
         st.subheader("Rechnung stornieren / Korrektur erstellen")
-        inv_to_cancel = st.selectbox("Rechnung für Korrektur auswählen", [inv[0] for inv in invoices if inv[4] == 'Aktiv'])
-        if inv_to_cancel and st.button("Gutschrift / Storno-Rechnung erstellen"):
-            orig = run_query("SELECT customer_name, total_amount, items FROM invoices WHERE invoice_nr = ?", (inv_to_cancel,), fetch=True)
-            if orig:
-                corr_nr = get_next_invoice_nr(is_correction=True)
-                run_query("UPDATE invoices SET status = 'Storniert' WHERE invoice_nr = ?", (inv_to_cancel,))
-                run_query("INSERT INTO invoices (invoice_nr, date, customer_name, total_amount, items, status) VALUES (?, ?, ?, ?, ?, ?)",
-                          (corr_nr, datetime.now().strftime("%Y-%m-%d"), orig[0][0], -orig[0][1], orig[0][2], 'Korrektur'))
-                st.success(f"Korrekturrechnung {corr_nr} für Rechnung {inv_to_cancel} erfolgreich erstellt!")
-                st.rerun()
+        active_invs = [inv[0] for inv in invoices if inv[4] == 'Aktiv']
+        if active_invs:
+            inv_to_cancel = st.selectbox("Rechnung für Korrektur auswählen", active_invs)
+            if st.button("Gutschrift / Storno-Rechnung erstellen"):
+                orig = run_query("SELECT customer_name, total_amount, items FROM invoices WHERE invoice_nr = ?", (inv_to_cancel,), fetch=True)
+                if orig:
+                    corr_nr = get_next_invoice_nr(is_correction=True)
+                    run_query("UPDATE invoices SET status = 'Storniert' WHERE invoice_nr = ?", (inv_to_cancel,))
+                    run_query("INSERT INTO invoices (invoice_nr, date, customer_name, total_amount, items, status) VALUES (?, ?, ?, ?, ?, ?)",
+                              (corr_nr, datetime.now().strftime("%Y-%m-%d"), orig[0][0], -orig[0][1], orig[0][2], 'Korrektur'))
+                    st.success(f"Korrekturrechnung {corr_nr} für Rechnung {inv_to_cancel} erfolgreich erstellt!")
+                    st.rerun()
+        else:
+            st.info("Keine aktiven Rechnungen zum Stornieren vorhanden.")
     else:
         st.info("Keine Rechnungen vorhanden.")
 
-# TAB 5: EINSTELLUNGEN & LOGO
+# TAB 5
 with tab5:
     st.header("Einstellungen, Bankdaten & Logo")
     
