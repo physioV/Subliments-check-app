@@ -12,8 +12,12 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- DATENBANK-SETUP & AUTOMATISCHER EXCEL-IMPORT ---
-def init_db_and_import():
+# --- SESSION STATE INITIALISIERUNG (Verhindert KeyError) ---
+if "cart" not in st.session_state:
+    st.session_state.cart = []
+
+# --- DATENBANK-SETUP ---
+def init_db():
     conn = sqlite3.connect("supplement_system.db")
     c = conn.cursor()
     
@@ -56,45 +60,9 @@ def init_db_and_import():
     ''')
     
     conn.commit()
-
-    # Automatischer Erstimport aus NE-Tool_AI.xlsx, falls vorhanden
-    excel_filename = "NE-Tool_AI.xlsx"
-    if os.path.exists(excel_filename):
-        # Prüfen, ob Produkte bereits importiert wurden
-        c.execute("SELECT COUNT(*) FROM inventory")
-        count = c.fetchone()[0]
-        
-        if count == 0:
-            try:
-                # Tabellenblatt 'Produkte' importieren
-                df_prod = pd.read_excel(excel_filename, sheet_name="Produkte", header=None)
-                # Zeile 1 enhält Überschriften: 1: Name, 2: Inhalt, 3: EK, 5: VK
-                imported_items = 0
-                for i in range(2, len(df_prod)):
-                    row = df_prod.iloc[i]
-                    p_name = row[1]
-                    p_inhalt = str(row[2]) if pd.notnull(row[2]) else ""
-                    
-                    if pd.notnull(p_name) and str(p_name).strip() != "":
-                        full_name = f"{p_name} ({p_inhalt})" if p_inhalt else str(p_name)
-                        ek = float(row[3]) if pd.notnull(row[3]) and str(row[3]).replace('.','',1).isdigit() else 0.0
-                        vk = float(row[5]) if pd.notnull(row[5]) and str(row[5]).replace('.','',1).isdigit() else 0.0
-                        barcode = f"ART-{imported_items + 1000}"
-                        
-                        c.execute('''
-                            INSERT OR IGNORE INTO inventory 
-                            (barcode, product_name, substance_link, stock, purchase_price, selling_price, mhd)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ''', (barcode, full_name, str(p_name), 10, ek, vk, '2027-12-31'))
-                        imported_items += 1
-                        
-                conn.commit()
-            except Exception as e:
-                pass
-
     conn.close()
 
-init_db_and_import()
+init_db()
 
 # --- HILFSFUNKTION FÜR DATENBANK-ABFRAGEN ---
 def run_query(query, params=(), fetch=False):
@@ -107,6 +75,54 @@ def run_query(query, params=(), fetch=False):
     conn.commit()
     conn.close()
     return data
+
+# --- EXCEL IMPORT FUNKTION ---
+def import_excel_data(file_source):
+    try:
+        df_prod = pd.read_excel(file_source, sheet_name="Produkte", header=None)
+        imported_items = 0
+        
+        conn = sqlite3.connect("supplement_system.db")
+        c = conn.cursor()
+        
+        for i in range(2, len(df_prod)):
+            row = df_prod.iloc[i]
+            p_name = row[1]
+            p_inhalt = str(row[2]) if pd.notnull(row[2]) else ""
+            
+            if pd.notnull(p_name) and str(p_name).strip() != "" and str(p_name) != "Name":
+                full_name = f"{p_name} ({p_inhalt})" if p_inhalt else str(p_name)
+                
+                try:
+                    ek = float(row[3]) if pd.notnull(row[3]) else 0.0
+                except:
+                    ek = 0.0
+                    
+                try:
+                    vk = float(row[5]) if pd.notnull(row[5]) else 0.0
+                except:
+                    vk = 0.0
+                    
+                barcode = f"ART-{imported_items + 1000}"
+                
+                c.execute('''
+                    INSERT OR REPLACE INTO inventory 
+                    (barcode, product_name, substance_link, stock, purchase_price, selling_price, mhd)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (barcode, full_name, str(p_name), 10, ek, vk, '2027-12-31'))
+                imported_items += 1
+                
+        conn.commit()
+        conn.close()
+        return imported_items
+    except Exception as e:
+        return f"Fehler: {e}"
+
+# Auto-Import ausführen, wenn Datei im Repo liegt und DB noch leer ist
+if os.path.exists("NE-Tool_AI.xlsx"):
+    existing_items = run_query("SELECT COUNT(*) FROM inventory", fetch=True)
+    if existing_items and existing_items[0][0] == 0:
+        import_excel_data("NE-Tool_AI.xlsx")
 
 # --- PDF GENERATOREN ---
 def generate_invoice_pdf(customer, items, total):
@@ -179,7 +195,7 @@ def generate_promo_pdf(product_name, title, description, cofactors, promo_price)
     
     return pdf.output(dest='S').encode('latin-1')
 
-# --- OBERFLÄCHE (TABS) ---
+# --- OBERFLÄCHE ---
 st.title("🌿 Intelligent Supplement Management System")
 
 tab1, tab2, tab3, tab4 = st.tabs([
@@ -189,7 +205,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "📣 4. Monats-Angebot"
 ])
 
-# TAB 1
+# TAB 1: WISSEN
 with tab1:
     st.header("Wirkstoff- & Wissen-Verwaltung")
     col1, col2 = st.columns([1, 2])
@@ -222,25 +238,35 @@ with tab1:
         else:
             st.info("Noch keine manuellen Wirkstoffe erfasst.")
 
-# TAB 2
+# TAB 2: LAGER
 with tab2:
     st.header("Shop- & Lagerbestand")
     
-    st.subheader("Aktueller Lagerbestand (Inklusive importierte Produkte)")
+    with st.expander("📥 Excel-Datei (NE-Tool_AI.xlsx) manuell importieren"):
+        uploaded_file = st.file_uploader("Datei auswählen", type=["xlsx", "xls"])
+        if uploaded_file is not None:
+            res = import_excel_data(uploaded_file)
+            if isinstance(res, int):
+                st.success(f"{res} Produkte erfolgreich importiert!")
+                st.rerun()
+            else:
+                st.error(res)
+
+    st.subheader("Aktueller Lagerbestand")
     inventory_data = run_query("SELECT barcode, product_name, stock, purchase_price, selling_price, mhd FROM inventory", fetch=True)
     if inventory_data:
-        df_inv = pd.DataFrame(inventory_data, columns=["Artikelnummer / Barcode", "Produktbezeichnung", "Bestand", "EK (€)", "VK (€)", "MHD"])
+        df_inv = pd.DataFrame(inventory_data, columns=["Artikelnummer", "Produktbezeichnung", "Bestand", "EK (€)", "VK (€)", "MHD"])
         st.dataframe(df_inv, use_container_width=True, height=450)
     else:
-        st.info("Lager ist zurzeit leer.")
+        st.info("Lager ist zurzeit leer. Bitte Excel-Datei oben hochladen oder im Repo ablegen.")
 
-# TAB 3
+# TAB 3: VERKAUF
 with tab3:
     st.header("Beratung & Blitz-Verkauf")
     col_left, col_right = st.columns([1, 1])
     
     with col_left:
-        st.subheader("1. Artikel im Lager suchen / auswählen")
+        st.subheader("1. Artikel im Lager suchen")
         products = run_query("SELECT barcode, product_name, selling_price FROM inventory", fetch=True)
         
         if products:
@@ -248,16 +274,15 @@ with tab3:
             selected_label = st.selectbox("Produkt auswählen", list(prod_dict.keys()))
             selected_prod = prod_dict[selected_label]
             
-            if "cart" not in st.session_state:
-                st.session_state.cart = []
-                
             if st.button("Zum Warenkorb hinzufügen"):
                 st.session_state.cart.append({"name": selected_prod[1], "price": selected_prod[2], "qty": 1})
                 st.success(f"'{selected_prod[1]}' im Warenkorb!")
+        else:
+            st.warning("Keine Produkte im Lager gefunden.")
 
     with col_right:
         st.subheader("2. Warenkorb & Rechnung")
-        customer_name = st.text_input("Kundenname / Patient", value="Kunde Max Mustermann")
+        customer_name = st.text_input("Kundenname / Patient", value="Max Mustermann")
         
         if st.session_state.cart:
             cart_df = pd.DataFrame(st.session_state.cart)
@@ -286,7 +311,7 @@ with tab3:
         else:
             st.info("Der Warenkorb ist leer.")
 
-# TAB 4
+# TAB 4: MARKETING
 with tab4:
     st.header("📣 Monats-Empfehlungskarte (Aktions-Flyer)")
     
