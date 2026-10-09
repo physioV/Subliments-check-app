@@ -77,6 +77,7 @@ def run_query(query, params=(), fetch=False):
     return data
 
 # --- EXCEL IMPORT FUNKTION ---
+# --- OPTIMIERTE EXCEL IMPORT FUNKTION (Liest alle 131 Produkte) ---
 def import_excel_data(file_source):
     try:
         df_prod = pd.read_excel(file_source, sheet_name="Produkte", header=None)
@@ -85,28 +86,38 @@ def import_excel_data(file_source):
         conn = sqlite3.connect("supplement_system.db")
         c = conn.cursor()
         
+        # Vorheriges Lager leeren, um Duplikate zu vermeiden
+        c.execute("DELETE FROM inventory")
+        
         for i in range(2, len(df_prod)):
             row = df_prod.iloc[i]
             p_name = row[1]
             p_inhalt = str(row[2]) if pd.notnull(row[2]) else ""
             
+            # Nur gültige Zeilen einlesen
             if pd.notnull(p_name) and str(p_name).strip() != "" and str(p_name) != "Name":
-                full_name = f"{p_name} ({p_inhalt})" if p_inhalt else str(p_name)
+                full_name = f"{str(p_name).strip()} ({p_inhalt})" if p_inhalt and p_inhalt.strip() != "" else str(p_name).strip()
                 
+                # Einkaufspreis säubern (entfernt '€', Leerzeichen und ersetzt ',' durch '.')
+                raw_ek = str(row[3]) if pd.notnull(row[3]) else "0"
+                raw_ek_clean = raw_ek.replace("€", "").replace("\u2009", "").replace(",", ".").strip()
                 try:
-                    ek = float(row[3]) if pd.notnull(row[3]) else 0.0
+                    ek = float(raw_ek_clean)
                 except:
                     ek = 0.0
                     
+                # Verkaufspreis säubern
+                raw_vk = str(row[5]) if pd.notnull(row[5]) else "0"
+                raw_vk_clean = raw_vk.replace("€", "").replace("\u2009", "").replace(",", ".").strip()
                 try:
-                    vk = float(row[5]) if pd.notnull(row[5]) else 0.0
+                    vk = float(raw_vk_clean)
                 except:
                     vk = 0.0
                     
                 barcode = f"ART-{imported_items + 1000}"
                 
                 c.execute('''
-                    INSERT OR REPLACE INTO inventory 
+                    INSERT INTO inventory 
                     (barcode, product_name, substance_link, stock, purchase_price, selling_price, mhd)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', (barcode, full_name, str(p_name), 10, ek, vk, '2027-12-31'))
@@ -116,7 +127,7 @@ def import_excel_data(file_source):
         conn.close()
         return imported_items
     except Exception as e:
-        return f"Fehler: {e}"
+        return f"Fehler beim Import: {e}"
 
 # Auto-Import ausführen, wenn Datei im Repo liegt und DB noch leer ist
 if os.path.exists("NE-Tool_AI.xlsx"):
